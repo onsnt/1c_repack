@@ -66,20 +66,42 @@ def should_skip_path(file_path, root_path):
         pass
     return False
 
-def run_v8unpack(args, timeout=60):
-    """Вызов утилиты v8unpack."""
+def run_v8unpack_saby(action, source_path, target_path, timeout=60):
+    """
+    Безопасный вызов Python-пакета v8unpack (saby-integration) через модуль Python.
+    action: '-u' (unpack) или '-p' (pack)
+    """
+    src = str(Path(source_path).resolve())
+    tgt = str(Path(target_path).resolve())
+    
+    # Синтаксис saby-integration: python -m v8unpack -u <source> <target>
+    cmd = ["python", "-m", "v8unpack", action, src, tgt]
+    
     try:
-        res = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
-        return res.returncode == 0, res.stderr.strip()
+        res = subprocess.run(
+            cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True, 
+            encoding="utf-8", 
+            timeout=timeout
+        )
+        if res.returncode == 0:
+            return True, ""
+        else:
+            err_msg = res.stderr.strip() or res.stdout.strip()
+            return False, err_msg
+    except FileNotFoundError:
+        return False, "Не найден интерпретатор Python или модуль v8unpack не установлен в окружении."
     except subprocess.TimeoutExpired:
-        return False, "Тайм-аут выполнения v8unpack"
+        return False, "Превышено время ожидания (тайм-аут) выполнения v8unpack."
     except Exception as e:
         return False, str(e)
 
-def process_pipeline(source_dir, target_dir, work_dir, targets_file=None, v8unpack_cmd="v8unpack"):
-    src_path = Path(source_dir)
-    tgt_path = Path(target_dir)
-    wrk_path = Path(work_dir)
+def process_pipeline(source_dir, target_dir, work_dir, targets_file=None):
+    src_path = Path(source_dir).resolve()
+    tgt_path = Path(target_dir).resolve()
+    wrk_path = Path(work_dir).resolve()
     
     tgt_path.mkdir(parents=True, exist_ok=True)
     wrk_path.mkdir(parents=True, exist_ok=True)
@@ -109,8 +131,8 @@ def process_pipeline(source_dir, target_dir, work_dir, targets_file=None, v8unpa
             shutil.rmtree(extracted_folder, ignore_errors=True)
         extracted_folder.mkdir(parents=True, exist_ok=True)
         
-        # Шаг 2: Распаковка
-        success, err = run_v8unpack([v8unpack_cmd, "-unpack", str(file_path), str(extracted_folder)])
+        # Шаг 2: Распаковка через saby-integration (-u)
+        success, err = run_v8unpack_saby("-u", file_path, extracted_folder)
         if not success:
             print(f"  [!] Ошибка распаковки: {err}")
             stats["fail"] += 1
@@ -164,9 +186,9 @@ def process_pipeline(source_dir, target_dir, work_dir, targets_file=None, v8unpa
         else:
             print(f"  [OK] Угроз не обнаружено.")
 
-        # Шаг 4: Обратная упаковка
+        # Шаг 4: Обратная упаковка через saby-integration (-p)
         output_file = tgt_path / file_path.name
-        success_pack, err_pack = run_v8unpack([v8unpack_cmd, "-pack", str(extracted_folder), str(output_file)])
+        success_pack, err_pack = run_v8unpack_saby("-p", extracted_folder, output_file)
         
         if success_pack:
             stats["packed"] += 1
@@ -174,7 +196,7 @@ def process_pipeline(source_dir, target_dir, work_dir, targets_file=None, v8unpa
         else:
             print(f"  [!] Ошибка упаковки: {err_pack}")
 
-    # Отчет
+    # Генерация итогового отчета
     report_path = tgt_path / f"audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(report_path, "w", encoding="utf-8") as rep:
         rep.write("=== ОТЧЕТ ПАЙПЛАЙНА АУДИТА И РЕФАКТОРИНГА 1С ===\n\n")
@@ -193,12 +215,12 @@ def process_pipeline(source_dir, target_dir, work_dir, targets_file=None, v8unpa
     print(f"[*] Готово. Отчет сохранен в: {report_path.absolute()}")
 
 if __name__ == "__main__":
-    src = input("Путь к каталогу с файлами (.cf, .epf, .erf): ").strip().strip('"\'')
-    tgt = input("Путь для сохранения обработанных файлов: ").strip().strip('"\'')
-    wrk = input("Путь для временной распаковки (например, C:\\Temp\\Work1C): ").strip().strip('"\'')
-    t_txt = input("Путь к текстовому файлу со списком логинов/ключей (Enter для дефолтных): ").strip().strip('"\'')
+    src_input = input("Путь к каталогу с файлами (.cf, .epf, .erf): ").strip().strip('"\'')
+    tgt_input = input("Путь для сохранения обработанных файлов: ").strip().strip('"\'')
+    wrk_input = input("Путь для временной распаковки (например, C:\\Temp\\Work1C): ").strip().strip('"\'')
+    t_txt_input = input("Путь к текстовому файлу со списком логинов/ключей (Enter для дефолтных): ").strip().strip('"\'')
     
-    if os.path.isdir(src):
-        process_pipeline(src, tgt, wrk, targets_file=t_txt if t_txt else None)
+    if os.path.isdir(src_input):
+        process_pipeline(src_input, tgt_input, wrk_input, targets_file=t_txt_input if t_txt_input else None)
     else:
-        print("[!] Ошибка: Указанный каталог не найден.")
+        print(f"[!] Ошибка: Указанный каталог не найден -> {src_input}")
