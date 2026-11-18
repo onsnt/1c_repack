@@ -5,7 +5,11 @@ import re
 from pathlib import Path
 from datetime import datetime
 
-# --- ПРАВИЛА И ФИЛЬТРЫ ---
+# --- СИСТЕМНЫЕ КЛЮЧЕВЫЕ СЛОВА (Имена переменных слева от =) ---
+SYSTEM_KEYWORDS = {
+    "пароль", "password", "pwd", "secret", "token", "токен", "api_key",
+    "логин", "login", "user", "пользователь", "имяпользователя"
+}
 
 EXCLUDED_VALUES = {"", "не указан", "none", "null", "false", "true", "admin", "administrator"}
 
@@ -21,8 +25,9 @@ WHITELIST_FILENAMES = {
     "Module.bsl"
 }
 
-def load_targets(file_path):
-    targets = set()
+def load_user_values(file_path):
+    """Загружает конкретные значения/логины из вашего текстового файла (права на правую сторону)."""
+    values = set()
     path = Path(file_path) if file_path else None
     
     if path and path.exists():
@@ -31,25 +36,20 @@ def load_targets(file_path):
                 for line in f:
                     clean = line.strip()
                     if clean and not clean.startswith("#"):
-                        targets.add(clean.lower())
-            print(f"[*] Загружено целей из файла '{path.name}': {len(targets)} шт.")
+                        values.add(clean.lower())
+            print(f"[*] Загружено учетных записей из файла '{path.name}': {len(values)} шт.")
         except Exception as e:
-            print(f"[!] Ошибка чтения файла целей: {e}")
+            print(f"[!] Ошибка чтения файла значений: {e}")
             
-    if not targets:
-        targets = {"пароль", "password", "pwd", "логин", "login", "user", "token", "токен", "secret"}
-        print("[*] Используются дефолтные ключевые слова.")
-        
-    return targets
+    return values
 
-def get_safe_replacement(keyword):
-    kw_lower = keyword.lower()
-    if any(k in kw_lower for k in ["пароль", "password", "pwd", "secret"]):
+def get_safe_replacement(var_name, val_str):
+    """Определяет, чем заменить найденное уязвимое значение (Пароль или Логин)."""
+    combined = (var_name + " " + val_str).lower()
+    if any(k in combined for k in ["пароль", "password", "pwd", "secret", "token", "11"]):
         return "ОбщегоНазначенияКлиентСервер.ПолучитьПараметрыПодключения().Пароль"
-    elif any(k in kw_lower for k in ["логин", "user", "login"]):
-        return "ОбщегоНазначенияКлиентСервер.ПолучитьПараметрыПодключения().Логин"
     else:
-        return f"ОбщегоНазначенияКлиентСервер.ПолучитьПараметрыПодключения().{keyword.capitalize()}"
+        return "ОбщегоНазначенияКлиентСервер.ПолучитьПараметрыПодключения().Логин"
 
 def should_skip_path(file_path, root_path):
     try:
@@ -75,11 +75,14 @@ def run_v8unpack_saby(action, source_path, target_path, timeout=60):
     except Exception as e:
         return False, str(e)
 
-def process_bsl_directory(root_dir, cred_regex, audit_log, container_name=""):
-    """Сканирует и правит .bsl файлы внутри указанного каталога."""
+def process_bsl_directory(root_dir, user_values, audit_log, container_name=""):
+    """Сканирует .bsl файлы и проверяет переменные и значения по списку."""
     root_path = Path(root_dir)
     modified_count = 0
     replacements_count = 0
+    
+    # Универсальное регулярное выражение для поиска любых присваиваний строк: Переменная = "Значение"
+    assignment_regex = re.compile(r"(?i)\b([a-zA-Zа-яА-Я0-9_]+)\s*=\s*\"([^\"]*)\"")
     
     for bsl_file in root_path.rglob("*.bsl"):
         if bsl_file.name not in WHITELIST_FILENAMES:
@@ -88,7 +91,6 @@ def process_bsl_directory(root_dir, cred_regex, audit_log, container_name=""):
             continue
             
         try:
-            # Читаем с защитой от кодировок (UTF-8 с BOM, UTF-8, ANSI)
             content = None
             for enc in ["utf-8-sig", "utf-8", "cp1251"]:
                 try:
@@ -105,14 +107,23 @@ def process_bsl_directory(root_dir, cred_regex, audit_log, container_name=""):
             
             def replace_match(match):
                 nonlocal replacements_count, file_mutated
-                keyword = match.group(1)
-                secret_val = match.group(2).strip()
+                var_name = match.group(1)
+                var_val = match.group(2)
                 
-                # Проверяем реальное наличие значения (не пустое и не заглушка)
-                if secret_val and secret_val.lower() not in EXCLUDED_VALUES:
+                val_clean = var_val.strip()
+                if not val_clean or val_clean.lower() in EXCLUDED_VALUES:
+                    return match.group(0)
+                
+                # Условие срабатывания:
+                # 1. Имя переменной входит в системные ключевые слова (например, Пароль, ИмяПользователя)
+                # 2. ИЛИ само значение в кавычках совпадает с логином/учеткой из вашего текстового файла
+                is_keyword_match = var_name.lower() in SYSTEM_KEYWORDS
+                is_value_match = val_clean.lower() in user_values
+                
+                if is_keyword_match or is_value_match:
                     file_mutated = True
                     replacements_count += 1
-                    safe_expr = get_safe_replacement(keyword)
+                    safe_expr = get_safe_replacement(var_name, var_val)
                     full_match = match.group(0)
                     indent_match = re.match(r"^(\s*)", full_match)
                     indent = indent_match.group(1) if indent_match else ""
@@ -121,12 +132,13 @@ def process_bsl_directory(root_dir, cred_regex, audit_log, container_name=""):
                         "container": container_name or root_path.name,
                         "module": str(bsl_file.relative_to(root_path)),
                         "match": full_match,
-                        "replacement": f"{indent}{keyword} = {safe_expr};"
+                        "replacement": f"{indent}{var_name} = {safe_expr};"
                     })
-                    return f"{indent}{keyword} = {safe_expr};"
+                    return f"{indent}{var_name} = {safe_expr};"
+                
                 return match.group(0)
 
-            new_content = cred_regex.sub(replace_match, content)
+            new_content = assignment_regex.sub(replace_match, content)
             
             if file_mutated:
                 modified_count += 1
@@ -152,26 +164,20 @@ def run_pipeline():
     
     src_input = input("Путь к исходному каталогу с файлами/структурой: ").strip().strip('"\'')
     tgt_input = input("Путь для сохранения результатов: ").strip().strip('"\'')
-    t_txt_input = input("Путь к файлу со списком логинов/ключей (Enter для дефолтных): ").strip().strip('"\'')
+    t_txt_input = input("Путь к текстовому файлу со списком логинов/учеток: ").strip().strip('"\'')
     
     src_path = Path(src_input).resolve()
     tgt_path = Path(tgt_input).resolve()
-    targets = load_targets(t_txt_input if t_txt_input else None)
-    
-    # Гибкое регулярное выражение для поиска ключевое_слово = "значение"
-    pattern_str = r"(?i)\b(" + "|".join(re.escape(t) for t in targets) + r")\b\s*=\s*\"([^\"]*)\""
-    cred_regex = re.compile(pattern_str)
+    user_values = load_user_values(t_txt_input)
     
     audit_log = []
     
     if mode == "1":
-        # РЕЖИМ 1: Работа с каталогом конфигурации (XML / EDT) напрямую
-        print(f"\n[*] Запуск аудита структуры конфигурации в каталоге: {src_path}")
+        print(f"\n[*] Аудит структуры конфигурации в каталоге: {src_path}")
         if not src_path.is_dir():
             print(f"[!] Каталог не найден: {src_path}")
             return
             
-        # Копируем структуру в целевую папку, чтобы не портить оригинал
         if tgt_path != src_path:
             if tgt_path.exists():
                 shutil.rmtree(tgt_path)
@@ -180,11 +186,10 @@ def run_pipeline():
         else:
             work_target = src_path
             
-        mod_files, total_rep = process_bsl_directory(work_target, cred_regex, audit_log, container_name="Configuration_XML")
-        print(f"\n[*] Аудит конфигурации завершен. Изменено модулей: {mod_files}, заменено секретов: {total_rep}")
+        mod_files, total_rep = process_bsl_directory(work_target, user_values, audit_log, container_name="Configuration_XML")
+        print(f"\n[*] Готово. Изменено модулей: {mod_files}, заменено секретов: {total_rep}")
         
     elif mode == "2":
-        # РЕЖИМ 2: Пакетная обработка контейнеров .epf / .erf / .cf
         wrk_input = input("Путь к временной рабочей папке для распаковки: ").strip().strip('"\'')
         wrk_path = Path(wrk_input).resolve()
         
@@ -198,14 +203,14 @@ def run_pipeline():
         processed_count = 0
         
         if skip_unpack:
-            print(f"\n[*] РЕЖИМ БЕЗ РАСПАКОВКИ: Сканируем готовые папки в {wrk_path}")
+            print(f"\n[*] РЕЖИМ БЕЗ РАСПАКОВКИ: Сканируем папки в {wrk_path}")
             folders = [f for f in wrk_path.iterdir() if f.is_dir()]
             for folder in folders:
                 print(f"\n[Анализ папки] {folder.name}")
-                _, reps = process_bsl_directory(folder, cred_regex, audit_log, container_name=folder.name)
+                _, reps = process_bsl_directory(folder, user_values, audit_log, container_name=folder.name)
                 total_replacements += reps
                 processed_count += 1
-                # В режиме без распаковки упаковка обратно НЕ выполняется
+            # В режиме без распаковки упаковка обратно не требуется
         else:
             containers = list(src_path.rglob("*.epf")) + list(src_path.rglob("*.erf")) + list(src_path.rglob("*.cf"))
             print(f"\n[*] Найдено контейнеров для пайплайна: {len(containers)}")
@@ -217,17 +222,14 @@ def run_pipeline():
                     shutil.rmtree(extracted_dir, ignore_errors=True)
                 extracted_dir.mkdir(parents=True, exist_ok=True)
                 
-                # Распаковка
                 success, err = run_v8unpack_saby("-u", file_p, extracted_dir)
                 if not success:
                     print(f"  [!] Ошибка распаковки: {err}")
                     continue
                     
-                # Анализ и рефакторинг
-                _, reps = process_bsl_directory(extracted_dir, cred_regex, audit_log, container_name=file_p.name)
+                _, reps = process_bsl_directory(extracted_dir, user_values, audit_log, container_name=file_p.name)
                 total_replacements += reps
                 
-                # Обратная упаковка
                 out_file = tgt_path / file_p.name
                 success_pack, err_pack = run_v8unpack_saby("-p", extracted_dir, out_file)
                 if success_pack:
@@ -236,12 +238,11 @@ def run_pipeline():
                 else:
                     print(f"  [!] Ошибка упаковки: {err_pack}")
                     
-        print(f"\n[*] Пайплайн обработок завершен. Обработано контейнеров: {processed_count}, заменено уязвимостей: {total_replacements}")
+        print(f"\n[*] Пайплайн завершен. Обработано: {processed_count}, заменено уязвимостей: {total_replacements}")
     else:
         print("[!] Неверный выбор режима.")
         return
 
-    # Генерация отчета
     report_path = tgt_path / f"audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(report_path, "w", encoding="utf-8") as rep:
         rep.write("=== ОТЧЕТ АУДИТА И РЕФАКТОРИНГА 1С ===\n\n")
