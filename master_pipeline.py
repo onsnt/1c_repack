@@ -5,18 +5,16 @@ import re
 from pathlib import Path
 from datetime import datetime
 
-# --- КОНФИГУРАЦИЯ И СЛОВАРЕЙ ПРАВИЛ ---
+# --- КОНФИГУРАЦИЯ И ПРАВИЛА ---
 
 EXCLUDED_VALUES = {"", "не указан", "none", "null", "false", "true", "admin", "administrator"}
 
+# Черный каталог (исключаем формы, макеты и служебные папки)
 BLACKLIST_DIRS = {
-    "Templates",     # Макеты
-    "Forms",         # Формы
-    "Ext",           # Внутренние структуры
-    "Tests",         # Тесты
-    "Pictures"       # Картинки
+    "Templates", "Forms", "Ext", "Tests", "Pictures"
 }
 
+# Белый список файлов модулей для проверки и рефакторинга
 WHITELIST_FILENAMES = {
     "ObjectModule.bsl",
     "ManagerModule.bsl",
@@ -25,21 +23,31 @@ WHITELIST_FILENAMES = {
     "Module.bsl"
 }
 
-def load_targets(file_path=None):
-    """Загружает список целевых ключей/логинов из файла или возвращает дефолтный набор."""
+def load_targets(file_path):
+    """Корректно загружает список логинов/ключей из текстового файла."""
     targets = set()
-    if file_path and Path(file_path).exists():
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                clean = line.strip()
-                if clean and not clean.startswith("#"):
-                    targets.add(clean.lower())
+    path = Path(file_path) if file_path else None
+    
+    if path and path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    clean = line.strip()
+                    if clean and not clean.startswith("#"):
+                        targets.add(clean.lower())
+            print(f"[*] Успешно загружено целей из файла '{path.name}': {len(targets)} шт.")
+        except Exception as e:
+            print(f"[!] Ошибка чтения файла целей: {e}")
+            
     if not targets:
+        # Дефолтный набор, если файл не задан или пуст
         targets = {"пароль", "password", "pwd", "логин", "login", "user", "token", "токен", "secret"}
+        print("[*] Используются стандартные ключевые слова по умолчанию.")
+        
     return targets
 
 def get_safe_replacement(keyword):
-    """Генерирует безопасный вызов БСП."""
+    """Генерирует безопасный вызов общего модуля для старых конфигураций (УПП 1.3)."""
     kw_lower = keyword.lower()
     if any(k in kw_lower for k in ["пароль", "password", "pwd", "secret"]):
         return "ОбщегоНазначенияКлиентСервер.ПолучитьПараметрыПодключения().Пароль"
@@ -58,8 +66,8 @@ def should_skip_path(file_path, root_path):
         pass
     return False
 
-def run_v8unpack(args, timeout=30):
-    """Вспомогательная функция вызова v8unpack с обработкой ошибок."""
+def run_v8unpack(args, timeout=60):
+    """Вызов утилиты v8unpack."""
     try:
         res = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
         return res.returncode == 0, res.stderr.strip()
@@ -68,53 +76,48 @@ def run_v8unpack(args, timeout=30):
     except Exception as e:
         return False, str(e)
 
-def process_pipeline(source_epf_dir, target_epf_dir, work_dir, targets_file=None, v8unpack_cmd="v8unpack"):
-    src_path = Path(source_epf_dir)
-    tgt_path = Path(target_epf_dir)
+def process_pipeline(source_dir, target_dir, work_dir, targets_file=None, v8unpack_cmd="v8unpack"):
+    src_path = Path(source_dir)
+    tgt_path = Path(target_dir)
     wrk_path = Path(work_dir)
     
     tgt_path.mkdir(parents=True, exist_ok=True)
     wrk_path.mkdir(parents=True, exist_ok=True)
     
+    # 1. Загрузка целей из файла
     targets = load_targets(targets_file)
+    
+    # Динамическое формирование безопасного RegExp на базе загруженного списка
     pattern_str = r"(?i)\b(" + "|".join(re.escape(t) for t in targets) + r")\b\s*=\s*\"([^\"]+)\""
     cred_regex = re.compile(pattern_str)
     
-    epf_files = list(src_path.rglob("*.epf")) + list(src_path.rglob("*.erf"))
-    total = len(epf_files)
+    # Ищем файлы .cf, .epf, .erf
+    container_files = list(src_path.rglob("*.cf")) + list(src_path.rglob("*.epf")) + list(src_path.rglob("*.erf"))
+    total = len(container_files)
     
-    print(f"[*] Старт единого пайплайна обработки обработок 1С.")
-    print(f"[*] Найдено файлов для обработки: {total}")
+    print(f"[*] Старт единого пайплайна. Найдено файлов (.cf/.epf/.erf): {total}")
     print("=" * 70)
     
-    stats = {
-        "unpacked_success": 0,
-        "unpacked_fail": 0,
-        "files_modified": 0,
-        "total_replacements": 0,
-        "packed_success": 0,
-        "packed_fail": 0
-    }
-    
+    stats = {"success": 0, "fail": 0, "modified": 0, "replacements": 0, "packed": 0}
     audit_log = []
     
-    for idx, epf_path in enumerate(epf_files, 1):
-        print(f"\n[{idx}/{total}] Обработка файла: {epf_path.name}")
+    for idx, file_path in enumerate(container_files, 1):
+        print(f"\n[{idx}/{total}] Обработка: {file_path.name}")
         
-        # Шаг 1: Распаковка
-        extracted_folder = wrk_path / epf_path.stem
+        extracted_folder = wrk_path / file_path.stem
         if extracted_folder.exists():
             shutil.rmtree(extracted_folder, ignore_errors=True)
         extracted_folder.mkdir(parents=True, exist_ok=True)
         
-        success, err = run_v8unpack([v8unpack_cmd, "-unpack", str(epf_path), str(extracted_folder)])
+        # Шаг 2: Распаковка
+        success, err = run_v8unpack([v8unpack_cmd, "-unpack", str(file_path), str(extracted_folder)])
         if not success:
             print(f"  [!] Ошибка распаковки: {err}")
-            stats["unpacked_fail"] += 1
+            stats["fail"] += 1
             continue
-        stats["unpacked_success"] += 1
+        stats["success"] += 1
         
-        # Шаг 2: Рефакторинг (поиск и замена в .bsl модулях)
+        # Шаг 3: Поиск и замена в BSL-модулях
         file_replacements = 0
         for bsl_file in extracted_folder.rglob("*.bsl"):
             if bsl_file.name not in WHITELIST_FILENAMES:
@@ -133,14 +136,14 @@ def process_pipeline(source_epf_dir, target_epf_dir, work_dir, targets_file=None
                     
                     if secret_val and secret_val not in EXCLUDED_VALUES:
                         file_replacements += 1
-                        stats["total_replacements"] += 1
+                        stats["replacements"] += 1
                         safe_expr = get_safe_replacement(keyword)
                         full_match = match.group(0)
                         indent_match = re.match(r"^(\s*)", full_match)
                         indent = indent_match.group(1) if indent_match else ""
                         
                         audit_log.append({
-                            "epf": epf_path.name,
+                            "container": file_path.name,
                             "module": bsl_file.name,
                             "match": full_match,
                             "replacement": f"{indent}{keyword} = {safe_expr};"
@@ -156,53 +159,46 @@ def process_pipeline(source_epf_dir, target_epf_dir, work_dir, targets_file=None
                 print(f"  [!] Ошибка модификации модуля {bsl_file.name}: {ex}")
                 
         if file_replacements > 0:
-            stats["files_modified"] += 1
-            print(f"  [FIX] Найдено и заменено секретов в модулях: {file_replacements}")
+            stats["modified"] += 1
+            print(f"  [FIX] Заменено вхождений: {file_replacements}")
         else:
-            print(f"  [OK] Укгроз не обнаружено.")
+            print(f"  [OK] Угроз не обнаружено.")
 
-        # Шаг 3: Обратная упаковка в EPF/ERF
-        output_epf_file = tgt_path / epf_path.name
-        success_pack, err_pack = run_v8unpack([v8unpack_cmd, "-pack", str(extracted_folder), str(output_epf_file)])
+        # Шаг 4: Обратная упаковка
+        output_file = tgt_path / file_path.name
+        success_pack, err_pack = run_v8unpack([v8unpack_cmd, "-pack", str(extracted_folder), str(output_file)])
         
         if success_pack:
-            stats["packed_success"] += 1
-            print(f"  [OK] Успешно запаковано обратно -> {output_epf_file.name}")
+            stats["packed"] += 1
+            print(f"  [OK] Успешно запаковано -> {output_file.name}")
         else:
-            stats["packed_fail"] += 1
-            print(f"  [!] Ошибка обратной упаковки: {err_pack}")
+            print(f"  [!] Ошибка упаковки: {err_pack}")
 
-    # Сохранение итогового отчета
-    report_path = tgt_path / f"pipeline_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    # Отчет
+    report_path = tgt_path / f"audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(report_path, "w", encoding="utf-8") as rep:
-        rep.write("=== СВОДНЫЙ ОТЧЕТ ПАЙПЛАЙНА АУДИТА И РЕФАКТОРИНГА EPF ===\n\n")
-        rep.write(f"Всего файлов обработано: {total}\n")
-        rep.write(f"Успешно распаковано: {stats['unpacked_success']}\n")
-        rep.write(f"Ошибок распаковки: {stats['unpacked_fail']}\n")
-        rep.write(f"Модифицировано файлов: {stats['files_modified']}\n")
-        rep.write(f"Всего заменено уязвимостей: {stats['total_replacements']}\n")
-        rep.write(f"Успешно упаковано обратно: {stats['packed_success']}\n")
-        rep.write(f"Ошибок упаковки: {stats['packed_fail']}\n\n")
+        rep.write("=== ОТЧЕТ ПАЙПЛАЙНА АУДИТА И РЕФАКТОРИНГА 1С ===\n\n")
+        rep.write(f"Обработано файлов: {total}\n")
+        rep.write(f"Успешно распаковано: {stats['success']}\n")
+        rep.write(f"Модифицировано файлов: {stats['modified']}\n")
+        rep.write(f"Заменено уязвимостей: {stats['replacements']}\n\n")
         rep.write("--- ДЕТАЛИЗАЦИЯ ИСПРАВЛЕНИЙ ---\n")
         for item in audit_log:
-            rep.write(f"Файл: {item['epf']} | Модуль: {item['module']}\n")
+            rep.write(f"Файл: {item['container']} | Модуль: {item['module']}\n")
             rep.write(f"  Было:  {item['match']}\n")
             rep.write(f"  Стало: {item['replacement']}\n")
             rep.write("-" * 40 + "\n")
             
     print("=" * 70)
-    print(f"[*] Пайплайн завершен.")
-    print(f"    Итоговый отчет сохранен в: {report_path.absolute()}")
+    print(f"[*] Готово. Отчет сохранен в: {report_path.absolute()}")
 
 if __name__ == "__main__":
-    src_dir = input("Путь к исходной папке с файлами .epf/.erf: ").strip().strip('"\'')
-    tgt_dir = input("Путь для сохранения обработанных .epf/.erf: ").strip().strip('"\'')
-    wrk_dir = input("Путь для временной распаковки (например, C:\\Temp\\EpfsWork): ").strip().strip('"\'')
+    src = input("Путь к каталогу с файлами (.cf, .epf, .erf): ").strip().strip('"\'')
+    tgt = input("Путь для сохранения обработанных файлов: ").strip().strip('"\'')
+    wrk = input("Путь для временной распаковки (например, C:\\Temp\\Work1C): ").strip().strip('"\'')
+    t_txt = input("Путь к текстовому файлу со списком логинов/ключей (Enter для дефолтных): ").strip().strip('"\'')
     
-    t_file = input("Путь к файлу со списком учетных записей/ключей (Enter для стандартных): ").strip().strip('"\'')
-    t_file = t_file if t_file else None
-    
-    if os.path.isdir(src_dir):
-        process_pipeline(src_dir, tgt_dir, wrk_dir, targets_file=t_file)
+    if os.path.isdir(src):
+        process_pipeline(src, tgt, wrk, targets_file=t_txt if t_txt else None)
     else:
-        print("[!] Ошибка: Указанная исходная директория не существует.")
+        print("[!] Ошибка: Указанный каталог не найден.")
