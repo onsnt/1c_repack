@@ -2,6 +2,7 @@ import os
 import subprocess
 import shutil
 import re
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
@@ -26,7 +27,6 @@ WHITELIST_FILENAMES = {
 }
 
 def load_user_values(file_path):
-    """Загружает конкретные значения/логины из вашего текстового файла (права на правую сторону)."""
     values = set()
     path = Path(file_path) if file_path else None
     
@@ -44,7 +44,6 @@ def load_user_values(file_path):
     return values
 
 def get_safe_replacement(var_name, val_str):
-    """Определяет, чем заменить найденное уязвимое значение (Пароль или Логин)."""
     combined = (var_name + " " + val_str).lower()
     if any(k in combined for k in ["пароль", "password", "pwd", "secret", "token", "11"]):
         return "ОбщегоНазначенияКлиентСервер.ПолучитьПараметрыПодключения().Пароль"
@@ -75,13 +74,38 @@ def run_v8unpack_saby(action, source_path, target_path, timeout=60):
     except Exception as e:
         return False, str(e)
 
+def get_file_hash(file_path):
+    """Вычисляет MD5-хэш файла для проверки изменений."""
+    hasher = hashlib.md5()
+    try:
+        with open(file_path, "rb") as f:
+            buf = f.read(65536)
+            while len(buf) > 0:
+                hasher.update(buf)
+                buf = f.read(65536)
+        return hasher.hexdigest()
+    except Exception:
+        return None
+
+def smart_copy_file(src_file, tgt_file):
+    """Копирует файл в целевой каталог, только если он изменился (сравнение по MD5)."""
+    src_p = Path(src_file)
+    tgt_p = Path(tgt_file)
+    
+    if tgt_p.exists():
+        src_hash = get_file_hash(src_p)
+        tgt_hash = get_file_hash(tgt_p)
+        if src_hash and tgt_hash and src_hash == tgt_hash:
+            return False # Файл не изменился, копирование пропущено
+            
+    tgt_p.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_p, tgt_p)
+    return True # Файл скопирован (новый или измененный)
+
 def process_bsl_directory(root_dir, user_values, audit_log, container_name=""):
-    """Сканирует .bsl файлы и проверяет переменные и значения по списку."""
     root_path = Path(root_dir)
     modified_count = 0
     replacements_count = 0
-    
-    # Универсальное регулярное выражение для поиска любых присваиваний строк: Переменная = "Значение"
     assignment_regex = re.compile(r"(?i)\b([a-zA-Zа-яА-Я0-9_]+)\s*=\s*\"([^\"]*)\"")
     
     for bsl_file in root_path.rglob("*.bsl"):
@@ -114,9 +138,6 @@ def process_bsl_directory(root_dir, user_values, audit_log, container_name=""):
                 if not val_clean or val_clean.lower() in EXCLUDED_VALUES:
                     return match.group(0)
                 
-                # Условие срабатывания:
-                # 1. Имя переменной входит в системные ключевые слова (например, Пароль, ИмяПользователя)
-                # 2. ИЛИ само значение в кавычках совпадает с логином/учеткой из вашего текстового файла
                 is_keyword_match = var_name.lower() in SYSTEM_KEYWORDS
                 is_value_match = val_clean.lower() in user_values
                 
@@ -163,14 +184,15 @@ def run_pipeline():
     mode = input("Введите номер режима (1 или 2): ").strip()
     
     src_input = input("Путь к исходному каталогу с файлами/структурой: ").strip().strip('"\'')
-    tgt_input = input("Путь для сохранения результатов: ").strip().strip('"\'')
-    t_txt_input = input("Путь к текстовому файлу со списком логинов/учеток: ").strip().strip('"\'')
+    tgt_input = input("Путь для сохранения результатов (готовый каталог): ").strip().strip('"\'')
+    t_txt_input = input("Путь к файлу со списком логинов/учеток: ").strip().strip('"\'')
     
     src_path = Path(src_input).resolve()
     tgt_path = Path(tgt_input).resolve()
     user_values = load_user_values(t_txt_input)
     
     audit_log = []
+    tgt_path.mkdir(parents=True, exist_ok=True)
     
     if mode == "1":
         print(f"\n[*] Аудит структуры конфигурации в каталоге: {src_path}")
@@ -178,15 +200,23 @@ def run_pipeline():
             print(f"[!] Каталог не найден: {src_path}")
             return
             
-        if tgt_path != src_path:
-            if tgt_path.exists():
-                shutil.rmtree(tgt_path)
-            shutil.copytree(src_path, tgt_path)
-            work_target = tgt_path
-        else:
-            work_target = src_path
-            
-        mod_files, total_rep = process_bsl_directory(work_target, user_values, audit_log, container_name="Configuration_XML")
+        # Полная синхронизация структуры конфигурации с умным пропуском неизмененных файлов
+        copied_count = 0
+        skipped_count = 0
+        
+        for src_file in src_path.rglob("*"):
+            if src_file.is_file():
+                rel_p = src_file.relative_to(src_path)
+                tgt_file = tgt_path / rel_p
+                if smart_copy_file(src_file, tgt_file):
+                    copied_count += 1
+                else:
+                    skipped_count += 1
+                    
+        print(f"[*] Синхронизация завершена. Скопировано/обновлено файлов: {copied_count}, пропущено (без изменений): {skipped_count}")
+        
+        # Запускаем рефакторинг прямо в целевом каталоге
+        mod_files, total_rep = process_bsl_directory(tgt_path, user_values, audit_log, container_name="Configuration_XML")
         print(f"\n[*] Готово. Изменено модулей: {mod_files}, заменено секретов: {total_rep}")
         
     elif mode == "2":
@@ -196,11 +226,12 @@ def run_pipeline():
         skip_unpack_input = input("Пропустить этап распаковки и анализировать готовые папки? (y/N): ").strip().lower()
         skip_unpack = (skip_unpack_input == 'y')
         
-        tgt_path.mkdir(parents=True, exist_ok=True)
         wrk_path.mkdir(parents=True, exist_ok=True)
         
         total_replacements = 0
         processed_count = 0
+        copied_containers = 0
+        skipped_containers = 0
         
         if skip_unpack:
             print(f"\n[*] РЕЖИМ БЕЗ РАСПАКОВКИ: Сканируем папки в {wrk_path}")
@@ -210,7 +241,6 @@ def run_pipeline():
                 _, reps = process_bsl_directory(folder, user_values, audit_log, container_name=folder.name)
                 total_replacements += reps
                 processed_count += 1
-            # В режиме без распаковки упаковка обратно не требуется
         else:
             containers = list(src_path.rglob("*.epf")) + list(src_path.rglob("*.erf")) + list(src_path.rglob("*.cf"))
             print(f"\n[*] Найдено контейнеров для пайплайна: {len(containers)}")
@@ -231,14 +261,27 @@ def run_pipeline():
                 total_replacements += reps
                 
                 out_file = tgt_path / file_p.name
-                success_pack, err_pack = run_v8unpack_saby("-p", extracted_dir, out_file)
+                
+                # Сначала упаковываем во временный файл или проверяем хэш запакованного
+                temp_out = wrk_path / ("temp_" + file_p.name)
+                success_pack, err_pack = run_v8unpack_saby("-p", extracted_dir, temp_out)
+                
                 if success_pack:
-                    print(f"  [OK] Запаковано обратно -> {out_file.name}")
+                    # Умное копирование: переносим в целевую папку только если файл изменился
+                    if smart_copy_file(temp_out, out_file):
+                        copied_containers += 1
+                        print(f"  [OK] Запаковано и обновлено -> {out_file.name}")
+                    else:
+                        skipped_containers += 1
+                        print(f"  [SKIP] Файл не изменился, пропущен -> {out_file.name}")
+                    
+                    if temp_out.exists():
+                        temp_out.unlink()
                     processed_count += 1
                 else:
                     print(f"  [!] Ошибка упаковки: {err_pack}")
                     
-        print(f"\n[*] Пайплайн завершен. Обработано: {processed_count}, заменено уязвимостей: {total_replacements}")
+        print(f"\n[*] Пайплайн завершен. Обработано: {processed_count}. Обновлено в целевой папке: {copied_containers}, пропущено без изменений: {skipped_containers}")
     else:
         print("[!] Неверный выбор режима.")
         return
